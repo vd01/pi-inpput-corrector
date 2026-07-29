@@ -1,0 +1,14 @@
+{
+  "name": "pi-input-corrector",
+  "version": "1.0.0",
+  "description": "Pi extension that checks user input for language quality and suggests natural English alternatives",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
