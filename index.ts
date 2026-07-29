@@ -525,7 +525,7 @@ export default function (pi: ExtensionAPI) {
       lastOriginalInput = event.text;
       passThrough = true;
       if (ctx.hasUI) {
-        ctx.ui.setEditorText(event.text);
+        
         ctx.ui.setWidget(WIDGET_ID, [
           "-- Input Corrector ------------------------------",
           " Chinese detected. Generating suggestions...",
@@ -597,7 +597,7 @@ export default function (pi: ExtensionAPI) {
     passThrough = true;
 
     if (ctx.hasUI) {
-      ctx.ui.setEditorText(event.text);
+        
       showSuggestionsWidget(ctx, event.text, suggestions);
     } else {
       console.error(
