@@ -328,6 +328,7 @@ export default function (pi: ExtensionAPI) {
   let config: CorrectorConfig | null = null;
   let providerConn: ProviderConnection | null = null;
   let awaitingRewrite = false;
+  let passThrough = false;
   let lastPlacedText = "";
   let lastOriginalInput = "";
 
@@ -345,6 +346,76 @@ export default function (pi: ExtensionAPI) {
         "-- Input Corrector ------------------------------",
         " Original input restored. Press Enter to re-check.",
       ]);
+    },
+  });
+
+  // --- Stats ---
+  let correctionsCount = 0;
+
+  // --- Commands ---
+  pi.registerCommand("corrector", {
+    description: "Input Corrector: status, toggle, mode, help",
+    handler: async (args, ctx) => {
+      const parts = (args ?? "").trim().split(/\s+/);
+      const sub = parts[0] || "status";
+
+      if (sub === "status") {
+        const lines = [
+          "Input Corrector Status",
+          "",
+          `  Enabled: ${config?.enabled ?? false}`,
+          `  Model: ${config?.model ?? "N/A"}`,
+          `  Fail mode: ${config?.failMode ?? "N/A"}`,
+          `  Provider: ${config?.providerId ?? "N/A"}`,
+          `  Corrections this session: ${correctionsCount}`,
+          `  Status: ${providerConn ? "Connected" : "Not connected"}`,
+        ];
+        ctx.ui.notify(lines.join("\n"), "info");
+        return;
+      }
+
+      if (sub === "toggle") {
+        if (!config) {
+          ctx.ui.notify("[corrector] Not configured", "warning");
+          return;
+        }
+        config.enabled = !config.enabled;
+        ctx.ui.notify(
+          `[corrector] ${config.enabled ? "Enabled" : "Disabled"}`,
+          config.enabled ? "success" : "warning",
+        );
+        return;
+      }
+
+      if (sub === "mode") {
+        if (!config) {
+          ctx.ui.notify("[corrector] Not configured", "warning");
+          return;
+        }
+        const mode = parts[1];
+        if (mode === "open" || mode === "closed") {
+          config.failMode = mode;
+          ctx.ui.notify(`[corrector] Fail mode set to ${mode}`, "info");
+        } else {
+          ctx.ui.notify("Usage: /corrector mode open|closed", "warning");
+        }
+        return;
+      }
+
+      if (sub === "help") {
+        ctx.ui.notify(
+          [
+            "/corrector status  — show config and stats",
+            "/corrector toggle  — enable/disable",
+            "/corrector mode open|closed — fail behavior",
+            "/corrector help    — this message",
+          ].join("\n"),
+          "info",
+        );
+        return;
+      }
+
+      ctx.ui.notify(`Unknown: /corrector ${sub}. Use /corrector help`, "warning");
     },
   });
 
@@ -417,8 +488,10 @@ export default function (pi: ExtensionAPI) {
     config = null;
     providerConn = null;
     awaitingRewrite = false;
+    passThrough = false;
     lastPlacedText = "";
     lastOriginalInput = "";
+    correctionsCount = 0;
   });
 
   // --- Input interception ------------------------------------------------
@@ -434,9 +507,9 @@ export default function (pi: ExtensionAPI) {
     if (event.text.startsWith("/") || event.text.startsWith("!"))
       return { action: "continue" };
 
-    // --- User pressed Enter on the same text that was placed in editor ---
-    // Let it through — they're accepting it as-is despite suggestions
-    if (event.text === lastPlacedText) {
+    // --- After a correction cycle, the next user input passes through ---
+    if (passThrough) {
+      passThrough = false;
       lastPlacedText = "";
       clearWidget(ctx);
       return { action: "continue" };
@@ -447,8 +520,10 @@ export default function (pi: ExtensionAPI) {
 
     if (hasChinese) {
       // Chinese detected — no delay, put input in editor immediately
+      correctionsCount++;
       lastPlacedText = event.text;
       lastOriginalInput = event.text;
+      passThrough = true;
       if (ctx.hasUI) {
         ctx.ui.setEditorText(event.text);
         ctx.ui.setWidget(WIDGET_ID, [
@@ -514,10 +589,12 @@ export default function (pi: ExtensionAPI) {
     }
 
     // --- Verdict: needs correction ---
+    correctionsCount++;
     // Place original text in editor so user can edit it directly
     const suggestions = verdict.suggestions ?? [];
     lastPlacedText = event.text;
     lastOriginalInput = event.text;
+    passThrough = true;
 
     if (ctx.hasUI) {
       ctx.ui.setEditorText(event.text);
