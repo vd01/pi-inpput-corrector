@@ -329,6 +329,24 @@ export default function (pi: ExtensionAPI) {
   let providerConn: ProviderConnection | null = null;
   let awaitingRewrite = false;
   let lastPlacedText = "";
+  let lastOriginalInput = "";
+
+  // --- Undo shortcut: restore original input in editor ---
+  pi.registerShortcut("escape", {
+    description: "Undo correction: restore original input",
+    handler: async (ctx) => {
+      if (!lastOriginalInput) return;
+      ctx.ui.setEditorText(lastOriginalInput);
+      awaitingRewrite = false;
+      const og = lastOriginalInput;
+      lastOriginalInput = "";
+      lastPlacedText = og;
+      ctx.ui.setWidget(WIDGET_ID, [
+        "-- Input Corrector ------------------------------",
+        " Original input restored. Press Enter to re-check.",
+      ]);
+    },
+  });
 
   // --- Session lifecycle --------------------------------------------------
 
@@ -400,6 +418,7 @@ export default function (pi: ExtensionAPI) {
     providerConn = null;
     awaitingRewrite = false;
     lastPlacedText = "";
+    lastOriginalInput = "";
   });
 
   // --- Input interception ------------------------------------------------
@@ -476,6 +495,7 @@ export default function (pi: ExtensionAPI) {
     // --- Verdict: needs correction ---
     const suggestions = verdict.suggestions ?? [];
     awaitingRewrite = true;
+    lastOriginalInput = event.text;
 
     if (ctx.hasUI) {
       showSuggestionsWidget(ctx, event.text, suggestions);
