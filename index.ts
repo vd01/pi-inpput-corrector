@@ -328,6 +328,7 @@ export default function (pi: ExtensionAPI) {
   let config: CorrectorConfig | null = null;
   let providerConn: ProviderConnection | null = null;
   let awaitingRewrite = false;
+  let lastPlacedText = "";
 
   // --- Session lifecycle --------------------------------------------------
 
@@ -398,6 +399,7 @@ export default function (pi: ExtensionAPI) {
     config = null;
     providerConn = null;
     awaitingRewrite = false;
+    lastPlacedText = "";
   });
 
   // --- Input interception ------------------------------------------------
@@ -417,10 +419,18 @@ export default function (pi: ExtensionAPI) {
     if (awaitingRewrite) {
       awaitingRewrite = false;
       clearWidget(ctx);
+      lastPlacedText = event.text;
       // Place rewrite in editor so user can review and further edit
       ctx.ui.setEditorText(event.text);
       // Stay in editor — user presses Enter again to trigger correction check
       return { action: "handled" };
+    }
+
+    // --- User pressed Enter on the same text that was placed in editor ---
+    // Let it through — they're accepting it as-is despite suggestions
+    if (event.text === lastPlacedText) {
+      lastPlacedText = "";
+      return { action: "continue" };
     }
 
     // --- Call the corrector sub-agent ---
