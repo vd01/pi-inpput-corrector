@@ -4,7 +4,7 @@
  * A Pi extension that checks each user input for language quality.
  * Uses a configured sub-agent (direct API call) with minimal overhead.
  *
- * Requirements:
+ * Auto-creates a default agent file on first run if none exists.
  *   - User creates ~/.pi/agent/agents/input-corrector.md (see README)
  *   - The agent file specifies model, system prompt, and x- config fields
  *
@@ -52,6 +52,47 @@ interface ProviderConnection {
 
 const AGENT_FILENAME = "input-corrector.md";
 const WIDGET_ID = "input-corrector";
+
+// --- Default Agent Template ------------------------------------------------
+
+const DEFAULT_AGENT_CONTENT = `---
+name: input-corrector
+description: Checks user input language quality and suggests natural alternatives
+model: google/gemini-2.5-flash
+x-fail-mode: open
+x-enabled: true
+---
+
+Analyze the user input below. Output ONLY a JSON object with no other text.
+
+Rules:
+- If the input is clear, natural, idiomatic English: {"verdict":"clear"}
+- If the input contains Chinese characters (even mixed with English): {"verdict":"needs_correction","suggestions":["...","..."]}
+- If the input is unnatural, awkward, or impractical English: {"verdict":"needs_correction","suggestions":["...","..."]}
+
+For "needs_correction", provide 1-3 idiomatic English alternatives.
+Make suggestions concise and natural - what a fluent speaker would actually write.
+`;
+
+/**
+ * Auto-create the default agent file if it doesn't exist.
+ * Returns the path where the file was created (or already existed), or null on failure.
+ */
+function ensureDefaultAgent(): string | null {
+  const agentsDir = path.join(getAgentDir(), "agents");
+  const filePath = path.join(agentsDir, AGENT_FILENAME);
+
+  if (fs.existsSync(filePath)) return filePath;
+
+  try {
+    fs.mkdirSync(agentsDir, { recursive: true });
+    fs.writeFileSync(filePath, DEFAULT_AGENT_CONTENT, "utf-8");
+    return filePath;
+  } catch (e) {
+    console.warn(`[input-corrector] Failed to create default agent file:`, e);
+    return null;
+  }
+}
 
 // --- Config Loading ---------------------------------------------------------
 
@@ -424,9 +465,22 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     config = loadConfig(ctx.cwd);
     if (!config) {
+      // Auto-create default agent file if missing
+      const created = ensureDefaultAgent();
+      if (created) {
+        config = loadConfig(ctx.cwd);
+        if (config && ctx.hasUI) {
+          ctx.ui.notify(
+            `[input-corrector] Created default config at ${created}`,
+            "info",
+          );
+        }
+      }
+    }
+    if (!config) {
       if (ctx.hasUI) {
         ctx.ui.notify(
-          `[input-corrector] Create ~/.pi/agent/agents/${AGENT_FILENAME} to enable`,
+          `[input-corrector] Could not load or create ~/.pi/agent/agents/${AGENT_FILENAME}`,
           "warning",
         );
       }

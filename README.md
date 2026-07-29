@@ -2,11 +2,21 @@
 
 Checks each user input for language quality. For non-idiomatic English or Chinese/mixed input, suggests improvements and waits for a rewrite. One correction round per input.
 
+## Install
+
+```bash
+pi install git:github.com/your-username/pi-input-corrector
+# or from npm:
+pi install npm:pi-input-corrector
+# or try without installing:
+pi -e /path/to/pi-input-corrector
+```
+
 ## Setup
 
-### 1. Create the agent file
+The extension **auto-creates** a default agent file on first run at `~/.pi/agent/agents/input-corrector.md` using `google/gemini-2.5-flash`. No manual setup required!
 
-Create `~/.pi/agent/agents/input-corrector.md`:
+To customize, edit the agent file:
 
 ```yaml
 ---
@@ -28,17 +38,15 @@ For "needs_correction", provide 1-3 idiomatic English alternatives.
 Make suggestions concise and natural - what a fluent speaker would actually write.
 ```
 
-### 2. Reload
-
-Run `/reload` inside pi. The extension notifies you on startup if the agent file is missing.
+After editing, run `/reload` inside pi.
 
 ## Frontmatter Fields
 
 | Field | Required | Default | Description |
 |---|---|---|---|
-| `name` | Yes | - | Agent name (must be `input-corrector`) |
-| `description` | Yes | - | Description shown in agent listing |
-| `model` | Yes | - | Model in `provider/model` format, e.g. `google/gemini-2.5-flash`, `openai/gpt-4o-mini` |
+| `name` | Yes | `input-corrector` | Agent name |
+| `description` | Yes | (auto-filled) | Description shown in agent listing |
+| `model` | Yes | `google/gemini-2.5-flash` | Model in `provider/model` format |
 | `x-fail-mode` | No | `open` | `open` = pass through on error, `closed` = block on error |
 | `x-enabled` | No | `true` | Set to `false` to disable correction |
 
@@ -46,6 +54,21 @@ Run `/reload` inside pi. The extension notifies you on startup if the agent file
 
 - **Google** (`google/`) - uses Gemini API format
 - **OpenAI-compatible** (`openai/`, `openrouter/`, `together/`, `groq/`, etc.) - uses Chat Completions API format
+
+## Commands
+
+| Command | Description |
+|---|---|
+| `/corrector status` | Show config and session stats |
+| `/corrector toggle` | Enable/disable correction |
+| `/corrector mode open\|closed` | Set fail behavior |
+| `/corrector help` | Show help |
+
+## Shortcuts
+
+| Shortcut | Description |
+|---|---|
+| `Alt+Backspace` | Undo correction, restore original input |
 
 ## How it works
 
