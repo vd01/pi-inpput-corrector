@@ -332,7 +332,7 @@ export default function (pi: ExtensionAPI) {
   let lastOriginalInput = "";
 
   // --- Undo shortcut: restore original input in editor ---
-  pi.registerShortcut("escape", {
+  pi.registerShortcut("alt+backspace", {
     description: "Undo correction: restore original input",
     handler: async (ctx) => {
       if (!lastOriginalInput) return;
@@ -434,25 +434,41 @@ export default function (pi: ExtensionAPI) {
     if (event.text.startsWith("/") || event.text.startsWith("!"))
       return { action: "continue" };
 
-    // --- State: awaiting user rewrite after suggestions ---
-    if (awaitingRewrite) {
-      awaitingRewrite = false;
-      clearWidget(ctx);
-      lastPlacedText = event.text;
-      // Place rewrite in editor so user can review and further edit
-      ctx.ui.setEditorText(event.text);
-      // Stay in editor — user presses Enter again to trigger correction check
-      return { action: "handled" };
-    }
-
     // --- User pressed Enter on the same text that was placed in editor ---
     // Let it through — they're accepting it as-is despite suggestions
     if (event.text === lastPlacedText) {
       lastPlacedText = "";
+      clearWidget(ctx);
       return { action: "continue" };
     }
 
-    // --- Call the corrector sub-agent ---
+    // --- Quick heuristic: detect Chinese chars instantly ---
+    const hasChinese = /[\u4e00-\u9fff]/.test(event.text);
+
+    if (hasChinese) {
+      // Chinese detected — no delay, put input in editor immediately
+      lastPlacedText = event.text;
+      lastOriginalInput = event.text;
+      if (ctx.hasUI) {
+        ctx.ui.setEditorText(event.text);
+        ctx.ui.setWidget(WIDGET_ID, [
+          "-- Input Corrector ------------------------------",
+          " Chinese detected. Generating suggestions...",
+        ]);
+        // Generate suggestions in background
+        callCorrector(event.text, config, providerConn, ctx.signal).then((v) => {
+          if (v?.verdict === "needs_correction" && v.suggestions?.length) {
+            showSuggestionsWidget(ctx, event.text, v.suggestions!);
+          }
+        });
+      }
+      return { action: "handled" };
+    }
+
+    // --- No Chinese — call LLM for unnatural English check ---
+    if (ctx.hasUI) {
+      ctx.ui.setStatus(WIDGET_ID, "[input-corrector] Checking...");
+    }
     let verdict: SubagentVerdict | null = null;
     try {
       verdict = await callCorrector(
@@ -463,6 +479,9 @@ export default function (pi: ExtensionAPI) {
       );
     } catch (e) {
       console.warn("[input-corrector] Unexpected error:", e);
+    }
+    if (ctx.hasUI) {
+      ctx.ui.setStatus(WIDGET_ID, undefined);
     }
 
     // --- Error / no verdict -> apply fail mode ---
@@ -481,6 +500,7 @@ export default function (pi: ExtensionAPI) {
           "warning",
         );
       }
+      clearWidget(ctx);
       return { action: "continue" };
     }
 
@@ -489,18 +509,20 @@ export default function (pi: ExtensionAPI) {
       if (ctx.hasUI) {
         ctx.ui.notify("✓ Natural English, proceeding", "success");
       }
+      clearWidget(ctx);
       return { action: "continue" };
     }
 
     // --- Verdict: needs correction ---
+    // Place original text in editor so user can edit it directly
     const suggestions = verdict.suggestions ?? [];
-    awaitingRewrite = true;
+    lastPlacedText = event.text;
     lastOriginalInput = event.text;
 
     if (ctx.hasUI) {
+      ctx.ui.setEditorText(event.text);
       showSuggestionsWidget(ctx, event.text, suggestions);
     } else {
-      // Non-TUI mode: log suggestions to stderr so user can see
       console.error(
         "[input-corrector] Suggestions:",
         suggestions.join(" | "),
