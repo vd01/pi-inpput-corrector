@@ -417,7 +417,10 @@ export default function (pi: ExtensionAPI) {
     if (awaitingRewrite) {
       awaitingRewrite = false;
       clearWidget(ctx);
-      return { action: "continue" };
+      // Place rewrite in editor so user can review and further edit
+      ctx.ui.setEditorText(event.text);
+      // Stay in editor — user presses Enter again to trigger correction check
+      return { action: "handled" };
     }
 
     // --- Call the corrector sub-agent ---
