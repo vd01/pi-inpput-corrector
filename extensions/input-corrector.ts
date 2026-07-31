@@ -370,25 +370,8 @@ export default function (pi: ExtensionAPI) {
   let providerConn: ProviderConnection | null = null;
   let awaitingRewrite = false;
   let passThrough = false;
-  let lastPlacedText = "";
-  let lastOriginalInput = "";
-
-  // --- Undo shortcut: restore original input in editor ---
-  pi.registerShortcut("alt+backspace", {
-    description: "Undo correction: restore original input",
-    handler: async (ctx) => {
-      if (!lastOriginalInput) return;
-      ctx.ui.setEditorText(lastOriginalInput);
-      awaitingRewrite = false;
-      const og = lastOriginalInput;
-      lastOriginalInput = "";
-      lastPlacedText = og;
-      ctx.ui.setWidget(WIDGET_ID, [
-        "-- Input Corrector ------------------------------",
-        " Original input restored. Press Enter to re-check.",
-      ]);
-    },
-  });
+  /** Bumped on every new check or pass-through, so late background results are ignored */
+  let checkSeq = 0;
 
   // --- Stats ---
   let correctionsCount = 0;
@@ -543,8 +526,7 @@ export default function (pi: ExtensionAPI) {
     providerConn = null;
     awaitingRewrite = false;
     passThrough = false;
-    lastPlacedText = "";
-    lastOriginalInput = "";
+    checkSeq = 0;
     correctionsCount = 0;
   });
 
@@ -553,6 +535,9 @@ export default function (pi: ExtensionAPI) {
   pi.on("input", async (event, ctx) => {
     // Skip if not fully configured
     if (!config?.enabled || !providerConn) return { action: "continue" };
+
+    // Skip in non-interactive modes (print/json): blocking input with no UI would hang it
+    if (!ctx.hasUI) return { action: "continue" };
 
     // Skip extension-injected messages
     if (event.source === "extension") return { action: "continue" };
@@ -564,7 +549,7 @@ export default function (pi: ExtensionAPI) {
     // --- After a correction cycle, the next user input passes through ---
     if (passThrough) {
       passThrough = false;
-      lastPlacedText = "";
+      checkSeq++; // invalidate any in-flight background check so it can't re-show a stale widget
       clearWidget(ctx);
       return { action: "continue" };
     }
@@ -575,22 +560,41 @@ export default function (pi: ExtensionAPI) {
     if (hasChinese) {
       // Chinese detected — no delay, put input in editor immediately
       correctionsCount++;
-      lastPlacedText = event.text;
-      lastOriginalInput = event.text;
       passThrough = true;
-      if (ctx.hasUI) {
-        
-        ctx.ui.setWidget(WIDGET_ID, [
-          "-- Input Corrector ------------------------------",
-          " Chinese detected. Generating suggestions...",
-        ]);
-        // Generate suggestions in background
-        callCorrector(event.text, config, providerConn, ctx.signal).then((v) => {
+      const seq = ++checkSeq;
+      const inputText = event.text;
+      // Restore the input into the editor so the user can see and edit it
+      // (the framework clears the input box and drops "handled" text)
+      ctx.ui.setEditorText(inputText);
+      ctx.ui.setWidget(WIDGET_ID, [
+        "-- Input Corrector ------------------------------",
+        " Chinese detected. Generating suggestions...",
+      ]);
+      // Generate suggestions in background. Handle EVERY outcome so the
+      // widget never stays stuck on "Generating suggestions...".
+      callCorrector(inputText, config, providerConn, ctx.signal)
+        .then((v) => {
+          if (seq !== checkSeq) return; // stale result - user already moved on
           if (v?.verdict === "needs_correction" && v.suggestions?.length) {
-            showSuggestionsWidget(ctx, event.text, v.suggestions!);
+            showSuggestionsWidget(ctx, inputText, v.suggestions!);
+          } else if (!v) {
+            // API error / timeout / unparseable response -> fail-open with a hint
+            ctx.ui.setWidget(WIDGET_ID, [
+              "-- Input Corrector ------------------------------",
+              " Your input:",
+              ` > ${inputText}`,
+              "",
+              " Could not generate suggestions (check failed).",
+              " Press Enter to send your input as-is.",
+            ]);
+          } else {
+            // Model said "clear" or gave no suggestions -> nothing to show
+            clearWidget(ctx);
           }
+        })
+        .catch(() => {
+          if (seq === checkSeq) clearWidget(ctx);
         });
-      }
       return { action: "handled" };
     }
 
@@ -646,13 +650,27 @@ export default function (pi: ExtensionAPI) {
     correctionsCount++;
     // Place original text in editor so user can edit it directly
     const suggestions = verdict.suggestions ?? [];
-    lastPlacedText = event.text;
-    lastOriginalInput = event.text;
     passThrough = true;
+    // Restore the input into the editor so the user can edit it directly
+    if (ctx.hasUI) {
+      ctx.ui.setEditorText(event.text);
+    }
 
     if (ctx.hasUI) {
-        
-      showSuggestionsWidget(ctx, event.text, suggestions);
+      if (suggestions.length) {
+        showSuggestionsWidget(ctx, event.text, suggestions);
+      } else {
+        // Model said "needs_correction" but gave no suggestions
+        ctx.ui.setWidget(WIDGET_ID, [
+          "-- Input Corrector ------------------------------",
+          " Your input:",
+          ` > ${event.text}`,
+          "",
+          " No suggestions available - please rewrite your input.",
+          "",
+          " Press Enter to send as-is.",
+        ]);
+      }
     } else {
       console.error(
         "[input-corrector] Suggestions:",
