@@ -39,6 +39,7 @@ interface CorrectorConfig {
 interface SubagentVerdict {
   verdict: "clear" | "needs_correction";
   suggestions?: string[];
+  failReason?: string;
 }
 
 /** Cached provider connection info resolved once at session start */
@@ -160,6 +161,7 @@ function buildOpenAIPayload(
     ],
     max_tokens: 300,
     temperature: 0.1,
+    response_format: { type: "json_object" },
   });
 }
 
@@ -275,7 +277,7 @@ async function callCorrector(
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10_000);
+  const timeout = setTimeout(() => controller.abort(), 25_000);
 
   try {
     const response = await fetch(url, {
@@ -292,7 +294,7 @@ async function callCorrector(
       console.warn(
         `[input-corrector] API error ${response.status}: ${errorText}`,
       );
-      return null;
+      return { verdict: "clear", failReason: `API error ${response.status}` };
     }
 
     const data = await response.json();
@@ -303,19 +305,40 @@ async function callCorrector(
       responseText =
         data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
     } else {
-      responseText = data?.choices?.[0]?.message?.content ?? "";
+      // OpenAI-compatible: try standard content, then DeepSeek reasoning_content
+      const msg = data?.choices?.[0]?.message;
+      responseText = msg?.content ?? "";
+      // DeepSeek reasoning models may put the answer in reasoning_content
+      // when content is empty (known DeepSeek API behavior)
+      if (!responseText && msg?.reasoning_content) {
+        // Try to extract JSON from the reasoning text
+        const jsonMatch = msg.reasoning_content.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          responseText = jsonMatch[0];
+          console.log("[input-corrector] Extracted JSON from reasoning_content fallback");
+        }
+      }
     }
 
-    if (!responseText) return null;
+    if (!responseText) {
+      // Log the full message object to diagnose empty responses
+      const msg = data?.choices?.[0]?.message;
+      console.warn("[input-corrector] Empty response text. Full message:", JSON.stringify(msg));
+      console.warn("[input-corrector] Full response:", JSON.stringify(data).slice(0, 1000));
+      return { verdict: "clear", failReason: "Empty response from model" };
+    }
 
-    return parseVerdict(responseText);
+    const parsed = parseVerdict(responseText);
+    if (!parsed) return { verdict: "clear", failReason: "Could not parse model response" };
+    return parsed;
   } catch (e: any) {
     if (e.name === "AbortError") {
       console.warn("[input-corrector] Request timed out");
+      return { verdict: "clear", failReason: "Request timed out (25s)" };
     } else {
       console.warn("[input-corrector] Request failed:", e);
+      return { verdict: "clear", failReason: `Request failed: ${e.message || e}` };
     }
-    return null;
   } finally {
     clearTimeout(timeout);
   }
@@ -576,15 +599,36 @@ export default function (pi: ExtensionAPI) {
         .then((v) => {
           if (seq !== checkSeq) return; // stale result - user already moved on
           if (v?.verdict === "needs_correction" && v.suggestions?.length) {
-            showSuggestionsWidget(ctx, inputText, v.suggestions!);
-          } else if (!v) {
+            // Skip if suggestions are too similar to original (model nitpicking)
+            const origLower = inputText.toLowerCase().trim();
+            const STOP_WORDS = new Set(['a','an','the','to','for','of','in','on','at','by','is','are','was','were','be','been','it','its','that','this','these','those','and','or','but','not','with','from','as','do','does','did','has','have','had','will','would','can','could','should','may','might','shall','must','if','then','than','so','no','up','out','just','also','very','too','more','most','some','any','all','each','every','both','few','many','much','own','other','such','only','same','being','having','doing']);
+            const hasMeaningful = v.suggestions.some((s: string) => {
+              const sLower = s.toLowerCase().trim();
+              if (sLower === origLower) return false;
+              const tokenize = (t: string) => t.split(/[\s,.;:!?()\[\]{}'"+]+/).filter((w: string) => w.length > 0);
+              const origWords = tokenize(origLower);
+              const suggWords = tokenize(sLower);
+              const origSet = new Set(origWords);
+              const suggSet = new Set(suggWords);
+              // Count novel CONTENT words (excluding stop words) in suggestion
+              const novelContentWords = [...suggSet].filter((w: string) => !origSet.has(w) && !STOP_WORDS.has(w)).length;
+              // If fewer than 2 novel content words, it's a trivial tweak
+              return novelContentWords >= 2;
+            });
+            if (hasMeaningful) {
+              showSuggestionsWidget(ctx, inputText, v.suggestions!);
+            } else {
+              clearWidget(ctx);
+            }
+          } else if (!v || v.failReason) {
             // API error / timeout / unparseable response -> fail-open with a hint
+            const reason = v?.failReason ?? "unknown error";
             ctx.ui.setWidget(WIDGET_ID, [
               "-- Input Corrector ------------------------------",
               " Your input:",
               ` > ${inputText}`,
               "",
-              " Could not generate suggestions (check failed).",
+              ` Could not generate suggestions (${reason}).`,
               " Press Enter to send your input as-is.",
             ]);
           } else {
@@ -647,9 +691,34 @@ export default function (pi: ExtensionAPI) {
     }
 
     // --- Verdict: needs correction ---
-    correctionsCount++;
-    // Place original text in editor so user can edit it directly
+    // Skip if suggestions are too similar to original (model was nitpicking)
     const suggestions = verdict.suggestions ?? [];
+    const originalLower = event.text.toLowerCase().trim();
+    const STOP_WORDS = new Set(['a','an','the','to','for','of','in','on','at','by','is','are','was','were','be','been','it','its','that','this','these','those','and','or','but','not','with','from','as','do','does','did','has','have','had','will','would','can','could','should','may','might','shall','must','if','then','than','so','no','up','out','just','also','very','too','more','most','some','any','all','each','every','both','few','many','much','own','other','such','only','same','being','having','doing']);
+    const hasMeaningfulSuggestion = suggestions.some((s) => {
+      const sLower = s.toLowerCase().trim();
+      if (sLower === originalLower) return false;
+      const tokenize = (t: string) => t.split(/[\s,.;:!?()\[\]{}'"+]+/).filter((w) => w.length > 0);
+      const origWords = tokenize(originalLower);
+      const suggWords = tokenize(sLower);
+      const origSet = new Set(origWords);
+      const suggSet = new Set(suggWords);
+      // Count novel CONTENT words (excluding stop words) in suggestion
+      const novelContentWords = [...suggSet].filter((w) => !origSet.has(w) && !STOP_WORDS.has(w)).length;
+      // If fewer than 2 novel content words, it's a trivial tweak
+      return novelContentWords >= 2;
+    });
+
+    if (!hasMeaningfulSuggestion) {
+      // Model flagged it but suggestions are cosmetic — treat as clear
+      if (ctx.hasUI) {
+        ctx.ui.notify("✓ Natural English, proceeding", "success");
+      }
+      clearWidget(ctx);
+      return { action: "continue" };
+    }
+
+    // Place original text in editor so user can edit it directly
     passThrough = true;
     // Restore the input into the editor so the user can edit it directly
     if (ctx.hasUI) {

@@ -39,6 +39,7 @@ interface CorrectorConfig {
 interface SubagentVerdict {
   verdict: "clear" | "needs_correction";
   suggestions?: string[];
+  failReason?: string;
 }
 
 /** Cached provider connection info resolved once at session start */
@@ -275,7 +276,7 @@ async function callCorrector(
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10_000);
+  const timeout = setTimeout(() => controller.abort(), 25_000);
 
   try {
     const response = await fetch(url, {
@@ -292,7 +293,7 @@ async function callCorrector(
       console.warn(
         `[input-corrector] API error ${response.status}: ${errorText}`,
       );
-      return null;
+      return { verdict: "clear", failReason: `API error ${response.status}` };
     }
 
     const data = await response.json();
@@ -306,16 +307,19 @@ async function callCorrector(
       responseText = data?.choices?.[0]?.message?.content ?? "";
     }
 
-    if (!responseText) return null;
+    if (!responseText) return { verdict: "clear", failReason: "Empty response from model" };
 
-    return parseVerdict(responseText);
+    const parsed = parseVerdict(responseText);
+    if (!parsed) return { verdict: "clear", failReason: "Could not parse model response" };
+    return parsed;
   } catch (e: any) {
     if (e.name === "AbortError") {
       console.warn("[input-corrector] Request timed out");
+      return { verdict: "clear", failReason: "Request timed out (25s)" };
     } else {
       console.warn("[input-corrector] Request failed:", e);
+      return { verdict: "clear", failReason: `Request failed: ${e.message || e}` };
     }
-    return null;
   } finally {
     clearTimeout(timeout);
   }
@@ -577,14 +581,15 @@ export default function (pi: ExtensionAPI) {
           if (seq !== checkSeq) return; // stale result - user already moved on
           if (v?.verdict === "needs_correction" && v.suggestions?.length) {
             showSuggestionsWidget(ctx, inputText, v.suggestions!);
-          } else if (!v) {
+          } else if (!v || v.failReason) {
             // API error / timeout / unparseable response -> fail-open with a hint
+            const reason = v?.failReason ?? "unknown error";
             ctx.ui.setWidget(WIDGET_ID, [
               "-- Input Corrector ------------------------------",
               " Your input:",
               ` > ${inputText}`,
               "",
-              " Could not generate suggestions (check failed).",
+              ` Could not generate suggestions (${reason}).`,
               " Press Enter to send your input as-is.",
             ]);
           } else {
