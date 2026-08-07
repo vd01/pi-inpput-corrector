@@ -6,7 +6,7 @@ Checks user input language quality. Suggests natural English alternatives for Ch
 
 | Field | Value |
 |---|---|
-| Model | `google/gemini-2.5-flash` |
+| Model | `deepseek/deepseek-v4-flash` |
 | Fail mode | `open` (pass through on error) |
 | Config | `~/.pi/agent/agents/input-corrector.md` |
 

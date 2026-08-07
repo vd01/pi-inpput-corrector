@@ -70,7 +70,7 @@ const STOP_WORDS = new Set([
 const DEFAULT_AGENT_CONTENT = `---
 name: input-corrector
 description: Checks user input language quality and suggests natural alternatives
-model: google/gemini-2.5-flash
+model: deepseek/deepseek-v4-flash
 x-fail-mode: open
 x-enabled: true
 ---

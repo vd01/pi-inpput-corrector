@@ -14,7 +14,7 @@ pi -e /path/to/pi-input-corrector
 
 ## Setup
 
-The extension **auto-creates** a default agent file on first run at `~/.pi/agent/agents/input-corrector.md` using `google/gemini-2.5-flash`. No manual setup required!
+The extension **auto-creates** a default agent file on first run at `~/.pi/agent/agents/input-corrector.md` using `deepseek/deepseek-v4-flash`. No manual setup required!
 
 To customize, edit the agent file:
 
@@ -22,7 +22,7 @@ To customize, edit the agent file:
 ---
 name: input-corrector
 description: Checks user input language quality and suggests natural alternatives
-model: google/gemini-2.5-flash
+model: deepseek/deepseek-v4-flash
 x-fail-mode: open
 x-enabled: true
 ---
@@ -46,7 +46,7 @@ After editing, run `/reload` inside pi.
 |---|---|---|---|
 | `name` | Yes | `input-corrector` | Agent name |
 | `description` | Yes | (auto-filled) | Description shown in agent listing |
-| `model` | Yes | `google/gemini-2.5-flash` | Model in `provider/model` format |
+| `model` | Yes | `deepseek/deepseek-v4-flash` | Model in `provider/model` format |
 | `x-fail-mode` | No | `open` | `open` = pass through on error, `closed` = block on error |
 | `x-enabled` | No | `true` | Set to `false` to disable correction |
 
