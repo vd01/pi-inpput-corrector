@@ -2,13 +2,34 @@
   "name": "pi-input-corrector",
   "version": "1.0.0",
   "description": "Pi extension that checks user input for language quality and suggests natural English alternatives",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "license": "MIT",
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
+  },
+  "main": "index.js",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vd01/pi-input-corrector.git"
+  },
+  "author": "",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/vd01/pi-input-corrector/issues"
+  },
+  "homepage": "https://github.com/vd01/pi-input-corrector#readme",
+  "devDependencies": {
+    "vitest": "^4.1.10"
   }
 }

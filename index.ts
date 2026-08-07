@@ -22,17 +22,11 @@ import * as path from "node:path";
 // --- Types ------------------------------------------------------------------
 
 interface CorrectorConfig {
-  /** Provider-qualified model name, e.g. "google/gemini-2.5-flash" */
   model: string;
-  /** Provider ID extracted from model field (e.g. "google") */
   providerId: string;
-  /** Model name extracted from model field (e.g. "gemini-2.5-flash") */
   modelName: string;
-  /** "open" = pass through on error, "closed" = block on error */
   failMode: "open" | "closed";
-  /** Master toggle */
   enabled: boolean;
-  /** System prompt from agent file body */
   systemPrompt: string;
 }
 
@@ -40,19 +34,36 @@ interface SubagentVerdict {
   verdict: "clear" | "needs_correction";
   suggestions?: string[];
   failReason?: string;
+  /** Raw model response text for diagnostics */
+  rawResponse?: string;
 }
 
-/** Cached provider connection info resolved once at session start */
 interface ProviderConnection {
   baseUrl: string;
   apiKey: string | undefined;
-  headers: Record<string, string>;
+  headers: Record<string, string | undefined>;
 }
 
 // --- Constants --------------------------------------------------------------
 
 const AGENT_FILENAME = "input-corrector.md";
 const WIDGET_ID = "input-corrector";
+const REQUEST_TIMEOUT_MS = 25_000;
+const MAX_SUGGESTIONS = 3;
+const RAW_RESPONSE_SLICE = 500;
+
+/** English stop words — used to detect trivial/cosmetic suggestions */
+const STOP_WORDS = new Set([
+  "a", "an", "the", "to", "for", "of", "in", "on", "at", "by",
+  "is", "are", "was", "were", "be", "been", "it", "its",
+  "that", "this", "these", "those", "and", "or", "but", "not",
+  "with", "from", "as", "do", "does", "did", "has", "have", "had",
+  "will", "would", "can", "could", "should", "may", "might",
+  "shall", "must", "if", "then", "than", "so", "no", "up", "out",
+  "just", "also", "very", "too", "more", "most", "some", "any",
+  "all", "each", "every", "both", "few", "many", "much", "own",
+  "other", "such", "only", "same", "being", "having", "doing",
+]);
 
 // --- Default Agent Template ------------------------------------------------
 
@@ -63,8 +74,7 @@ model: google/gemini-2.5-flash
 x-fail-mode: open
 x-enabled: true
 ---
-
-Analyze the user input below. Output ONLY a JSON object with no other text.
+Output ONLY a JSON object. Do NOT think, reason, analyze, or explain. No chain-of-thought. No commentary. Just the JSON.
 
 Rules:
 - If the input is clear, natural, idiomatic English: {"verdict":"clear"}
@@ -75,10 +85,45 @@ For "needs_correction", provide 1-3 idiomatic English alternatives.
 Make suggestions concise and natural - what a fluent speaker would actually write.
 `;
 
+// --- Helpers ----------------------------------------------------------------
+
+/** Tokenize text into words (split on punctuation/whitespace, drop empties) */
+export function tokenize(text: string): string[] {
+  return text.split(/[\s,.;:!?()\[\]{}'"+]+/).filter((w) => w.length > 0);
+}
+
 /**
- * Auto-create the default agent file if it doesn't exist.
- * Returns the path where the file was created (or already existed), or null on failure.
+ * Check whether any suggestion has ≥2 novel content words vs the original.
+ * Filters out trivial/cosmetic tweaks where the model is just nitpicking.
  */
+export function hasMeaningfulSuggestion(original: string, suggestions: string[]): boolean {
+  const origLower = original.toLowerCase().trim();
+  const origWords = new Set(tokenize(origLower));
+
+  return suggestions.some((s) => {
+    const sLower = s.toLowerCase().trim();
+    if (sLower === origLower) return false;
+    const novelContentWords = tokenize(sLower)
+      .filter((w) => !origWords.has(w) && !STOP_WORDS.has(w))
+      .length;
+    return novelContentWords >= 2;
+  });
+}
+
+/** Combine two AbortSignals: if either fires, the combined signal fires. */
+function anySignal(a: AbortSignal, b: AbortSignal): AbortSignal {
+  if (a.aborted) return a;
+  if (b.aborted) return b;
+  const controller = new AbortController();
+  const abort = (s: AbortSignal) => controller.abort(s.reason);
+  a.addEventListener("abort", () => abort(a), { once: true });
+  b.addEventListener("abort", () => abort(b), { once: true });
+  return controller.signal;
+}
+
+// --- Config -----------------------------------------------------------------
+
+/** Auto-create the default agent file if it doesn't exist. */
 function ensureDefaultAgent(): string | null {
   const agentsDir = path.join(getAgentDir(), "agents");
   const filePath = path.join(agentsDir, AGENT_FILENAME);
@@ -90,15 +135,13 @@ function ensureDefaultAgent(): string | null {
     fs.writeFileSync(filePath, DEFAULT_AGENT_CONTENT, "utf-8");
     return filePath;
   } catch (e) {
-    console.warn(`[input-corrector] Failed to create default agent file:`, e);
+    console.warn("[input-corrector] Failed to create default agent file:", e);
     return null;
   }
 }
 
-// --- Config Loading ---------------------------------------------------------
-
+/** Load config from agent file (searches user dir then project dir). */
 function loadConfig(cwd: string): CorrectorConfig | null {
-  // Search: user agent dir first, then project agent dirs
   const searchPaths = [
     path.join(getAgentDir(), "agents"),
     path.join(cwd, ".pi", "agents"),
@@ -114,9 +157,7 @@ function loadConfig(cwd: string): CorrectorConfig | null {
         parseFrontmatter<Record<string, string>>(content);
 
       if (!frontmatter.model) {
-        console.warn(
-          `[input-corrector] Agent file ${filePath} missing "model" field`,
-        );
+        console.warn(`[input-corrector] ${filePath} missing "model" field`);
         continue;
       }
 
@@ -142,18 +183,14 @@ function loadConfig(cwd: string): CorrectorConfig | null {
   return null;
 }
 
-// --- Provider API Calls -----------------------------------------------------
+// --- Provider API -----------------------------------------------------------
 
-/**
- * Build request payload for OpenAI-compatible API format.
- * Used for: openai, openrouter, together, groq, etc.
- */
-function buildOpenAIPayload(
+export function buildOpenAIPayload(
   modelName: string,
   systemPrompt: string,
   userInput: string,
-): string {
-  return JSON.stringify({
+): object {
+  return {
     model: modelName,
     messages: [
       { role: "system", content: systemPrompt },
@@ -162,69 +199,106 @@ function buildOpenAIPayload(
     max_tokens: 300,
     temperature: 0.1,
     response_format: { type: "json_object" },
-  });
+    reasoning_effort: "none",
+  };
 }
 
-/**
- * Build request payload for Google Gemini API format.
- */
-function buildGeminiPayload(
+export function buildGeminiPayload(
   modelName: string,
   systemPrompt: string,
   userInput: string,
-): string {
-  return JSON.stringify({
-    system_instruction: {
-      parts: [{ text: systemPrompt }],
-    },
-    contents: [
-      {
-        role: "user",
-        parts: [{ text: userInput }],
-      },
-    ],
+): object {
+  return {
+    system_instruction: { parts: [{ text: systemPrompt }] },
+    contents: [{ role: "user", parts: [{ text: userInput }] }],
     generationConfig: {
       maxOutputTokens: 300,
       temperature: 0.1,
+      responseMimeType: "application/json",
     },
-  });
+    thinkingConfig: { thinkingBudget: 0 },
+  };
 }
 
 /**
- * Extract JSON from the LLM response text (handles markdown code fences).
+ * Extract JSON from the LLM response text.
+ * Handles: code fences, prose-wrapped JSON, and raw JSON.
  */
-function extractJSON(text: string): string {
+export function extractJSON(text: string): string {
   const trimmed = text.trim();
-  // Try to extract from ```json ... ``` block
+
+  // 1. Code fence: ```json ... ``` or ``` ... ```
   const fenceMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (fenceMatch) return fenceMatch[1].trim();
-  // Try to extract from ``` ... ``` block (no language tag)
-  const fenceAnyMatch = trimmed.match(/```\s*([\s\S]*?)```/);
-  if (fenceAnyMatch) return fenceAnyMatch[1].trim();
-  // Assume the whole text is JSON
+
+  // 2. Brace-depth scan: find outermost {...} containing "verdict"
+  let depth = 0;
+  let start = -1;
+  for (let i = 0; i < trimmed.length; i++) {
+    const ch = trimmed[i];
+    if (ch === "{") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        const candidate = trimmed.slice(start, i + 1);
+        if (candidate.includes('"verdict"')) return candidate;
+        start = -1; // not our JSON, keep looking
+      }
+    }
+  }
+
+  // 3. Fallback: assume the whole text is JSON
   return trimmed;
 }
 
-/**
- * Parse the sub-agent's JSON response into a verdict.
- */
-function parseVerdict(responseText: string): SubagentVerdict | null {
+/** Parse the sub-agent's JSON response into a verdict. */
+export function parseVerdict(responseText: string): SubagentVerdict | null {
   try {
-    const json = extractJSON(responseText);
-    const parsed = JSON.parse(json);
+    const parsed = JSON.parse(extractJSON(responseText));
     if (parsed.verdict === "clear") return { verdict: "clear" };
     if (parsed.verdict === "needs_correction") {
       return {
         verdict: "needs_correction",
         suggestions: Array.isArray(parsed.suggestions)
-          ? parsed.suggestions.slice(0, 3)
+          ? parsed.suggestions.slice(0, MAX_SUGGESTIONS)
           : [],
       };
     }
+    console.warn(
+      `[input-corrector] Unknown verdict "${parsed.verdict}":`,
+      JSON.stringify(parsed).slice(0, RAW_RESPONSE_SLICE),
+    );
     return null;
-  } catch {
+  } catch (e) {
+    console.warn(
+      `[input-corrector] Parse failed (${responseText.length} chars):`,
+      responseText.slice(0, RAW_RESPONSE_SLICE),
+      "\nError:", e,
+    );
     return null;
   }
+}
+
+/** Extract response text from an OpenAI-compatible API response. */
+export function extractOpenAIText(data: any): string {
+  const msg = data?.choices?.[0]?.message;
+  let text = msg?.content ?? "";
+  // DeepSeek reasoning models may put the answer in reasoning_content
+  if (!text && msg?.reasoning_content) {
+    const jsonMatch = msg.reasoning_content.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      text = jsonMatch[0];
+      console.log("[input-corrector] Extracted from reasoning_content fallback");
+    }
+  }
+  return text;
+}
+
+/** Extract response text from a Gemini API response. */
+export function extractGeminiText(data: any): string {
+  return data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
 }
 
 /**
@@ -236,149 +310,113 @@ async function callCorrector(
   config: CorrectorConfig,
   conn: ProviderConnection,
   signal?: AbortSignal,
-): Promise<SubagentVerdict | null> {
+): Promise<SubagentVerdict> {
   const isGemini = config.providerId === "google";
+  const baseUrl = conn.baseUrl.replace(/\/+$/, "");
 
-  let url: string;
-  let body: string;
-  const requestHeaders: Record<string, string> = { ...conn.headers };
+  // Build request
+  const url = isGemini
+    ? `${baseUrl}/v1/models/${config.modelName}:generateContent`
+    : `${baseUrl}/chat/completions`;
 
-  if (isGemini) {
-    // Gemini API
-    const baseUrl = conn.baseUrl.replace(/\/+$/, "");
-    url = `${baseUrl}/v1/models/${config.modelName}:generateContent`;
-    body = buildGeminiPayload(
-      config.modelName,
-      config.systemPrompt,
-      userInput,
-    );
-    requestHeaders["Content-Type"] = "application/json";
-    if (conn.apiKey && !requestHeaders["x-goog-api-key"]) {
-      requestHeaders["x-goog-api-key"] = conn.apiKey;
-    }
-  } else {
-    // OpenAI-compatible
-    const baseUrl = conn.baseUrl.replace(/\/+$/, "");
-    url = `${baseUrl}/chat/completions`;
-    body = buildOpenAIPayload(
-      config.modelName,
-      config.systemPrompt,
-      userInput,
-    );
-    requestHeaders["Content-Type"] = "application/json";
-    if (conn.apiKey && !requestHeaders["Authorization"]) {
-      requestHeaders["Authorization"] = `Bearer ${conn.apiKey}`;
-    }
+  const body = JSON.stringify(
+    isGemini
+      ? buildGeminiPayload(config.modelName, config.systemPrompt, userInput)
+      : buildOpenAIPayload(config.modelName, config.systemPrompt, userInput),
+  );
+
+  const headers: Record<string, string> = {};
+  // Copy non-null headers from provider config
+  for (const [k, v] of Object.entries(conn.headers)) {
+    if (v != null) headers[k] = v;
   }
-
-  // Remove null-valued headers (suppression markers from provider config)
-  for (const [key, value] of Object.entries(requestHeaders)) {
-    if (value === null || value === undefined) delete requestHeaders[key];
+  headers["Content-Type"] = "application/json";
+  if (conn.apiKey) {
+    if (isGemini) {
+      if (!headers["x-goog-api-key"]) headers["x-goog-api-key"] = conn.apiKey;
+    } else {
+      if (!headers["Authorization"]) headers["Authorization"] = `Bearer ${conn.apiKey}`;
+    }
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 25_000);
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
   try {
     const response = await fetch(url, {
       method: "POST",
-      headers: requestHeaders,
+      headers,
       body,
-      signal: signal
-        ? anySignal(signal, controller.signal)
-        : controller.signal,
+      signal: signal ? anySignal(signal, controller.signal) : controller.signal,
     });
 
     if (!response.ok) {
       const errorText = await response.text().catch(() => "(no body)");
-      console.warn(
-        `[input-corrector] API error ${response.status}: ${errorText}`,
-      );
+      console.warn(`[input-corrector] API error ${response.status}: ${errorText}`);
       return { verdict: "clear", failReason: `API error ${response.status}` };
     }
 
     const data = await response.json();
-
-    // Extract text from response
-    let responseText: string;
-    if (isGemini) {
-      responseText =
-        data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-    } else {
-      // OpenAI-compatible: try standard content, then DeepSeek reasoning_content
-      const msg = data?.choices?.[0]?.message;
-      responseText = msg?.content ?? "";
-      // DeepSeek reasoning models may put the answer in reasoning_content
-      // when content is empty (known DeepSeek API behavior)
-      if (!responseText && msg?.reasoning_content) {
-        // Try to extract JSON from the reasoning text
-        const jsonMatch = msg.reasoning_content.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          responseText = jsonMatch[0];
-          console.log("[input-corrector] Extracted JSON from reasoning_content fallback");
-        }
-      }
-    }
+    const responseText = isGemini ? extractGeminiText(data) : extractOpenAIText(data);
 
     if (!responseText) {
-      // Log the full message object to diagnose empty responses
-      const msg = data?.choices?.[0]?.message;
-      console.warn("[input-corrector] Empty response text. Full message:", JSON.stringify(msg));
-      console.warn("[input-corrector] Full response:", JSON.stringify(data).slice(0, 1000));
-      return { verdict: "clear", failReason: "Empty response from model" };
+      console.warn(
+        "[input-corrector] Empty response. Message:",
+        JSON.stringify(data?.choices?.[0]?.message ?? data?.candidates?.[0]).slice(0, RAW_RESPONSE_SLICE),
+      );
+      return { verdict: "clear", failReason: "Empty response from model", rawResponse: "(empty)" };
     }
 
     const parsed = parseVerdict(responseText);
-    if (!parsed) return { verdict: "clear", failReason: "Could not parse model response" };
+    if (!parsed) {
+      return {
+        verdict: "clear",
+        failReason: "Could not parse model response",
+        rawResponse: responseText.slice(0, RAW_RESPONSE_SLICE),
+      };
+    }
+    parsed.rawResponse = responseText.slice(0, RAW_RESPONSE_SLICE);
     return parsed;
   } catch (e: any) {
-    if (e.name === "AbortError") {
-      console.warn("[input-corrector] Request timed out");
-      return { verdict: "clear", failReason: "Request timed out (25s)" };
-    } else {
-      console.warn("[input-corrector] Request failed:", e);
-      return { verdict: "clear", failReason: `Request failed: ${e.message || e}` };
-    }
+    const isTimeout = e.name === "AbortError";
+    console.warn(`[input-corrector] ${isTimeout ? "Request timed out" : "Request failed"}:`, e);
+    return {
+      verdict: "clear",
+      failReason: isTimeout ? "Request timed out (25s)" : `Request failed: ${e.message || e}`,
+    };
   } finally {
     clearTimeout(timeout);
   }
 }
 
-/**
- * Combine two AbortSignals: if either fires, the combined signal fires.
- */
-function anySignal(...signals: AbortSignal[]): AbortSignal {
-  const controller = new AbortController();
-  for (const s of signals) {
-    if (s.aborted) {
-      controller.abort(s.reason);
-      return controller.signal;
-    }
-    s.addEventListener("abort", () => controller.abort(s.reason), {
-      once: true,
-    });
-  }
-  return controller.signal;
-}
-
 // --- UI Helpers -------------------------------------------------------------
 
-function showSuggestionsWidget(
-  ctx: any,
-  originalInput: string,
-  suggestions: string[],
-) {
-  const lines: string[] = [];
-  lines.push("-- Input Corrector ------------------------------");
-  lines.push(" Your input:");
-  lines.push(` > ${originalInput}`);
-  lines.push("");
-  lines.push(" Suggestions:");
-  suggestions.forEach((s, i) => {
-    lines.push(` ${i + 1}. ${s}`);
-  });
-  lines.push("");
-  lines.push(" Please rewrite your input above. -------------- ");
+export function showSuggestionsWidget(ctx: any, originalInput: string, suggestions: string[]) {
+  const lines = [
+    "-- Input Corrector ------------------------------",
+    " Your input:",
+    ` > ${originalInput}`,
+    "",
+    " Suggestions:",
+    ...suggestions.map((s, i) => ` ${i + 1}. ${s}`),
+    "",
+    " Please rewrite your input above. --------------",
+  ];
+  ctx.ui.setWidget(WIDGET_ID, lines);
+}
+
+export function showErrorWidget(ctx: any, originalInput: string, reason: string, rawResponse?: string) {
+  const lines = [
+    "-- Input Corrector ------------------------------",
+    " Your input:",
+    ` > ${originalInput}`,
+    "",
+    ` Could not generate suggestions (${reason}).`,
+  ];
+  if (rawResponse) {
+    lines.push("", " Model raw response:", ` > ${rawResponse}`);
+  }
+  lines.push("", " Press Enter to send your input as-is.");
   ctx.ui.setWidget(WIDGET_ID, lines);
 }
 
@@ -391,78 +429,91 @@ function clearWidget(ctx: any) {
 export default function (pi: ExtensionAPI) {
   let config: CorrectorConfig | null = null;
   let providerConn: ProviderConnection | null = null;
-  let awaitingRewrite = false;
   let passThrough = false;
-  /** Bumped on every new check or pass-through, so late background results are ignored */
   let checkSeq = 0;
-
-  // --- Stats ---
   let correctionsCount = 0;
+  let lastRawResponse: string | null = null;
+  let debugMode = false;
 
   // --- Commands ---
+
   pi.registerCommand("corrector", {
-    description: "Input Corrector: status, toggle, mode, help",
+    description: "Input Corrector: status, toggle, mode, debug, help",
     handler: async (args, ctx) => {
-      const parts = (args ?? "").trim().split(/\s+/);
-      const sub = parts[0] || "status";
+      const sub = (args ?? "").trim().split(/\s+/)[0] || "status";
 
-      if (sub === "status") {
-        const lines = [
-          "Input Corrector Status",
-          "",
-          `  Enabled: ${config?.enabled ?? false}`,
-          `  Model: ${config?.model ?? "N/A"}`,
-          `  Fail mode: ${config?.failMode ?? "N/A"}`,
-          `  Provider: ${config?.providerId ?? "N/A"}`,
-          `  Corrections this session: ${correctionsCount}`,
-          `  Status: ${providerConn ? "Connected" : "Not connected"}`,
-        ];
-        ctx.ui.notify(lines.join("\n"), "info");
-        return;
-      }
-
-      if (sub === "toggle") {
-        if (!config) {
-          ctx.ui.notify("[corrector] Not configured", "warning");
-          return;
+      switch (sub) {
+        case "status": {
+          ctx.ui.notify(
+            [
+              "Input Corrector Status",
+              "",
+              `  Enabled: ${config?.enabled ?? false}`,
+              `  Model: ${config?.model ?? "N/A"}`,
+              `  Fail mode: ${config?.failMode ?? "N/A"}`,
+              `  Provider: ${config?.providerId ?? "N/A"}`,
+              `  Debug mode: ${debugMode}`,
+              `  Corrections this session: ${correctionsCount}`,
+              `  Status: ${providerConn ? "Connected" : "Not connected"}`,
+            ].join("\n"),
+            "info",
+          );
+          break;
         }
-        config.enabled = !config.enabled;
-        ctx.ui.notify(
-          `[corrector] ${config.enabled ? "Enabled" : "Disabled"}`,
-          config.enabled ? "success" : "warning",
-        );
-        return;
-      }
-
-      if (sub === "mode") {
-        if (!config) {
-          ctx.ui.notify("[corrector] Not configured", "warning");
-          return;
+        case "toggle": {
+          if (!config) { ctx.ui.notify("[corrector] Not configured", "warning"); break; }
+          config.enabled = !config.enabled;
+          ctx.ui.notify(
+            `[corrector] ${config.enabled ? "Enabled" : "Disabled"}`,
+            config.enabled ? "success" : "warning",
+          );
+          break;
         }
-        const mode = parts[1];
-        if (mode === "open" || mode === "closed") {
-          config.failMode = mode;
-          ctx.ui.notify(`[corrector] Fail mode set to ${mode}`, "info");
-        } else {
-          ctx.ui.notify("Usage: /corrector mode open|closed", "warning");
+        case "mode": {
+          if (!config) { ctx.ui.notify("[corrector] Not configured", "warning"); break; }
+          const mode = (args ?? "").trim().split(/\s+/)[1];
+          if (mode === "open" || mode === "closed") {
+            config.failMode = mode;
+            ctx.ui.notify(`[corrector] Fail mode set to ${mode}`, "info");
+          } else {
+            ctx.ui.notify("Usage: /corrector mode open|closed", "warning");
+          }
+          break;
         }
-        return;
+        case "debug": {
+          debugMode = !debugMode;
+          ctx.ui.notify(
+            `[corrector] Debug mode ${debugMode ? "ON" : "OFF"}`,
+            debugMode ? "success" : "warning",
+          );
+          break;
+        }
+        case "last": {
+          ctx.ui.notify(
+            lastRawResponse
+              ? `[corrector] Last raw response:\n${lastRawResponse}`
+              : "[corrector] No raw response recorded yet",
+            "info",
+          );
+          break;
+        }
+        case "help": {
+          ctx.ui.notify(
+            [
+              "/corrector status  — show config and stats",
+              "/corrector toggle  — enable/disable",
+              "/corrector mode open|closed — fail behavior",
+              "/corrector debug   — toggle debug mode (show raw model responses)",
+              "/corrector last    — show last raw model response",
+              "/corrector help    — this message",
+            ].join("\n"),
+            "info",
+          );
+          break;
+        }
+        default:
+          ctx.ui.notify(`Unknown: /corrector ${sub}. Use /corrector help`, "warning");
       }
-
-      if (sub === "help") {
-        ctx.ui.notify(
-          [
-            "/corrector status  — show config and stats",
-            "/corrector toggle  — enable/disable",
-            "/corrector mode open|closed — fail behavior",
-            "/corrector help    — this message",
-          ].join("\n"),
-          "info",
-        );
-        return;
-      }
-
-      ctx.ui.notify(`Unknown: /corrector ${sub}. Use /corrector help`, "warning");
     },
   });
 
@@ -471,15 +522,11 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     config = loadConfig(ctx.cwd);
     if (!config) {
-      // Auto-create default agent file if missing
       const created = ensureDefaultAgent();
       if (created) {
         config = loadConfig(ctx.cwd);
         if (config && ctx.hasUI) {
-          ctx.ui.notify(
-            `[input-corrector] Created default config at ${created}`,
-            "info",
-          );
+          ctx.ui.notify(`[input-corrector] Created default config at ${created}`, "info");
         }
       }
     }
@@ -495,256 +542,155 @@ export default function (pi: ExtensionAPI) {
 
     if (!config.enabled) return;
 
-    // Resolve provider: get baseUrl from Provider, apiKey+headers from Auth
     try {
       const provider = ctx.modelRegistry.getProvider(config.providerId);
       if (!provider) {
-        if (ctx.hasUI) {
-          ctx.ui.notify(
-            `[input-corrector] Provider "${config.providerId}" not found`,
-            "warning",
-          );
-        }
+        if (ctx.hasUI) ctx.ui.notify(`[input-corrector] Provider "${config.providerId}" not found`, "warning");
         return;
       }
 
       const baseUrl = provider.baseUrl;
       if (!baseUrl) {
-        if (ctx.hasUI) {
-          ctx.ui.notify(
-            `[input-corrector] Provider "${config.providerId}" has no base URL configured`,
-            "warning",
-          );
-        }
+        if (ctx.hasUI) ctx.ui.notify(`[input-corrector] Provider "${config.providerId}" has no base URL`, "warning");
         return;
       }
 
-      // Get resolved auth (API key + credential headers)
       const authResult = await ctx.modelRegistry.getProviderAuth(config.providerId);
       const resolvedAuth = authResult?.auth;
-
-      // apiKey: from auth resolution or provider config
       const apiKey = resolvedAuth?.apiKey || (provider.auth as any)?.apiKey?.key;
-
-      // headers: merge provider headers + resolved auth headers
-      const headers: Record<string, string> = {
-        ...(provider.headers as Record<string, string> | undefined),
-        ...(resolvedAuth?.headers as Record<string, string> | undefined),
+      const headers: Record<string, string | undefined> = {
+        ...(provider.headers as Record<string, string | undefined> | undefined),
+        ...(resolvedAuth?.headers as Record<string, string | undefined> | undefined),
       };
 
       providerConn = { baseUrl, apiKey, headers };
     } catch (e) {
       console.warn("[input-corrector] Failed to resolve provider:", e);
-      if (ctx.hasUI) {
-        ctx.ui.notify(
-          "[input-corrector] Failed to resolve provider",
-          "warning",
-        );
-      }
+      if (ctx.hasUI) ctx.ui.notify("[input-corrector] Failed to resolve provider", "warning");
     }
   });
 
   pi.on("session_shutdown", async () => {
     config = null;
     providerConn = null;
-    awaitingRewrite = false;
     passThrough = false;
     checkSeq = 0;
     correctionsCount = 0;
+    lastRawResponse = null;
+    debugMode = false;
   });
 
   // --- Input interception ------------------------------------------------
 
+  /** Handle a correction verdict result (shared by Chinese & English paths). */
+  function handleVerdict(
+    ctx: any,
+    inputText: string,
+    v: SubagentVerdict,
+  ): void {
+    lastRawResponse = v.rawResponse ?? null;
+
+    if (v.verdict === "needs_correction" && v.suggestions?.length) {
+      if (hasMeaningfulSuggestion(inputText, v.suggestions)) {
+        showSuggestionsWidget(ctx, inputText, v.suggestions);
+      } else {
+        clearWidget(ctx);
+      }
+    } else if (v.failReason) {
+      showErrorWidget(ctx, inputText, v.failReason, v.rawResponse);
+    } else {
+      // Model said "clear" or gave no suggestions
+      clearWidget(ctx);
+    }
+  }
+
   pi.on("input", async (event, ctx) => {
-    // Skip if not fully configured
     if (!config?.enabled || !providerConn) return { action: "continue" };
-
-    // Skip in non-interactive modes (print/json): blocking input with no UI would hang it
     if (!ctx.hasUI) return { action: "continue" };
-
-    // Skip extension-injected messages
     if (event.source === "extension") return { action: "continue" };
-
-    // Skip commands and bash escapes
     if (event.text.startsWith("/") || event.text.startsWith("!"))
       return { action: "continue" };
 
-    // --- After a correction cycle, the next user input passes through ---
+    // After a correction cycle, the next input passes through without re-check
     if (passThrough) {
       passThrough = false;
-      checkSeq++; // invalidate any in-flight background check so it can't re-show a stale widget
+      checkSeq++;
       clearWidget(ctx);
       return { action: "continue" };
     }
 
-    // --- Quick heuristic: detect Chinese chars instantly ---
-    const hasChinese = /[\u4e00-\u9fff]/.test(event.text);
-
-    if (hasChinese) {
-      // Chinese detected — no delay, put input in editor immediately
+    // --- Chinese detected: fast path (non-blocking) ---
+    if (/[\u4e00-\u9fff]/.test(event.text)) {
       correctionsCount++;
       passThrough = true;
       const seq = ++checkSeq;
       const inputText = event.text;
-      // Restore the input into the editor so the user can see and edit it
-      // (the framework clears the input box and drops "handled" text)
+
       ctx.ui.setEditorText(inputText);
       ctx.ui.setWidget(WIDGET_ID, [
         "-- Input Corrector ------------------------------",
         " Chinese detected. Generating suggestions...",
       ]);
-      // Generate suggestions in background. Handle EVERY outcome so the
-      // widget never stays stuck on "Generating suggestions...".
+
       callCorrector(inputText, config, providerConn, ctx.signal)
         .then((v) => {
-          if (seq !== checkSeq) return; // stale result - user already moved on
-          if (v?.verdict === "needs_correction" && v.suggestions?.length) {
-            // Skip if suggestions are too similar to original (model nitpicking)
-            const origLower = inputText.toLowerCase().trim();
-            const STOP_WORDS = new Set(['a','an','the','to','for','of','in','on','at','by','is','are','was','were','be','been','it','its','that','this','these','those','and','or','but','not','with','from','as','do','does','did','has','have','had','will','would','can','could','should','may','might','shall','must','if','then','than','so','no','up','out','just','also','very','too','more','most','some','any','all','each','every','both','few','many','much','own','other','such','only','same','being','having','doing']);
-            const hasMeaningful = v.suggestions.some((s: string) => {
-              const sLower = s.toLowerCase().trim();
-              if (sLower === origLower) return false;
-              const tokenize = (t: string) => t.split(/[\s,.;:!?()\[\]{}'"+]+/).filter((w: string) => w.length > 0);
-              const origWords = tokenize(origLower);
-              const suggWords = tokenize(sLower);
-              const origSet = new Set(origWords);
-              const suggSet = new Set(suggWords);
-              // Count novel CONTENT words (excluding stop words) in suggestion
-              const novelContentWords = [...suggSet].filter((w: string) => !origSet.has(w) && !STOP_WORDS.has(w)).length;
-              // If fewer than 2 novel content words, it's a trivial tweak
-              return novelContentWords >= 2;
-            });
-            if (hasMeaningful) {
-              showSuggestionsWidget(ctx, inputText, v.suggestions!);
-            } else {
-              clearWidget(ctx);
-            }
-          } else if (!v || v.failReason) {
-            // API error / timeout / unparseable response -> fail-open with a hint
-            const reason = v?.failReason ?? "unknown error";
-            ctx.ui.setWidget(WIDGET_ID, [
-              "-- Input Corrector ------------------------------",
-              " Your input:",
-              ` > ${inputText}`,
-              "",
-              ` Could not generate suggestions (${reason}).`,
-              " Press Enter to send your input as-is.",
-            ]);
-          } else {
-            // Model said "clear" or gave no suggestions -> nothing to show
-            clearWidget(ctx);
-          }
+          if (seq !== checkSeq) return; // stale
+          handleVerdict(ctx, inputText, v);
         })
         .catch(() => {
           if (seq === checkSeq) clearWidget(ctx);
         });
+
       return { action: "handled" };
     }
 
-    // --- No Chinese — call LLM for unnatural English check ---
-    if (ctx.hasUI) {
-      ctx.ui.setStatus(WIDGET_ID, "[input-corrector] Checking...");
-    }
+    // --- English: blocking check for unnatural phrasing ---
+    ctx.ui.setStatus(WIDGET_ID, "[input-corrector] Checking...");
+
     let verdict: SubagentVerdict | null = null;
     try {
-      verdict = await callCorrector(
-        event.text,
-        config,
-        providerConn,
-        ctx.signal,
-      );
+      verdict = await callCorrector(event.text, config, providerConn, ctx.signal);
+      lastRawResponse = verdict.rawResponse ?? null;
     } catch (e) {
       console.warn("[input-corrector] Unexpected error:", e);
     }
-    if (ctx.hasUI) {
-      ctx.ui.setStatus(WIDGET_ID, undefined);
-    }
 
-    // --- Error / no verdict -> apply fail mode ---
+    ctx.ui.setStatus(WIDGET_ID, undefined);
+
+    // No verdict → apply fail mode
     if (!verdict) {
       if (config.failMode === "closed") {
-        ctx.ui.notify(
-          "[input-corrector] Check failed - retry or fix agent config",
-          "error",
-        );
+        ctx.ui.notify("[input-corrector] Check failed - retry or fix agent config", "error");
         return { action: "handled" };
       }
-      // fail-open: pass through silently (or notify in TUI)
-      if (ctx.hasUI) {
-        ctx.ui.notify(
-          "[input-corrector] Skipped (error), proceeding",
-          "warning",
-        );
-      }
+      ctx.ui.notify("[input-corrector] Skipped (error), proceeding", "warning");
       clearWidget(ctx);
       return { action: "continue" };
     }
 
-    // --- Verdict: clear English ---
+    // Clear English → pass through
     if (verdict.verdict === "clear") {
-      if (ctx.hasUI) {
-        ctx.ui.notify("✓ Natural English, proceeding", "success");
-      }
+      ctx.ui.notify("✓ Natural English, proceeding", "success");
       clearWidget(ctx);
       return { action: "continue" };
     }
 
-    // --- Verdict: needs correction ---
-    // Skip if suggestions are too similar to original (model was nitpicking)
+    // Needs correction → check if suggestions are meaningful
     const suggestions = verdict.suggestions ?? [];
-    const originalLower = event.text.toLowerCase().trim();
-    const STOP_WORDS = new Set(['a','an','the','to','for','of','in','on','at','by','is','are','was','were','be','been','it','its','that','this','these','those','and','or','but','not','with','from','as','do','does','did','has','have','had','will','would','can','could','should','may','might','shall','must','if','then','than','so','no','up','out','just','also','very','too','more','most','some','any','all','each','every','both','few','many','much','own','other','such','only','same','being','having','doing']);
-    const hasMeaningfulSuggestion = suggestions.some((s) => {
-      const sLower = s.toLowerCase().trim();
-      if (sLower === originalLower) return false;
-      const tokenize = (t: string) => t.split(/[\s,.;:!?()\[\]{}'"+]+/).filter((w) => w.length > 0);
-      const origWords = tokenize(originalLower);
-      const suggWords = tokenize(sLower);
-      const origSet = new Set(origWords);
-      const suggSet = new Set(suggWords);
-      // Count novel CONTENT words (excluding stop words) in suggestion
-      const novelContentWords = [...suggSet].filter((w) => !origSet.has(w) && !STOP_WORDS.has(w)).length;
-      // If fewer than 2 novel content words, it's a trivial tweak
-      return novelContentWords >= 2;
-    });
-
-    if (!hasMeaningfulSuggestion) {
-      // Model flagged it but suggestions are cosmetic — treat as clear
-      if (ctx.hasUI) {
-        ctx.ui.notify("✓ Natural English, proceeding", "success");
-      }
+    if (!hasMeaningfulSuggestion(event.text, suggestions)) {
+      ctx.ui.notify("✓ Natural English, proceeding", "success");
       clearWidget(ctx);
       return { action: "continue" };
     }
 
-    // Place original text in editor so user can edit it directly
+    // Show correction UI
     passThrough = true;
-    // Restore the input into the editor so the user can edit it directly
-    if (ctx.hasUI) {
-      ctx.ui.setEditorText(event.text);
-    }
+    ctx.ui.setEditorText(event.text);
 
-    if (ctx.hasUI) {
-      if (suggestions.length) {
-        showSuggestionsWidget(ctx, event.text, suggestions);
-      } else {
-        // Model said "needs_correction" but gave no suggestions
-        ctx.ui.setWidget(WIDGET_ID, [
-          "-- Input Corrector ------------------------------",
-          " Your input:",
-          ` > ${event.text}`,
-          "",
-          " No suggestions available - please rewrite your input.",
-          "",
-          " Press Enter to send as-is.",
-        ]);
-      }
+    if (suggestions.length) {
+      showSuggestionsWidget(ctx, event.text, suggestions);
     } else {
-      console.error(
-        "[input-corrector] Suggestions:",
-        suggestions.join(" | "),
-      );
+      showErrorWidget(ctx, event.text, "No suggestions available");
     }
 
     return { action: "handled" };
